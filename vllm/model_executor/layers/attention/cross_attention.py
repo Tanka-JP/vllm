@@ -213,6 +213,10 @@ class CrossAttention(Attention):
                 "CrossAttention only supports AttentionType.ENCODER_DECODER"
             )
 
+        from vllm.v1.attention.backends._whisper_debug import enable_auto
+
+        enable_auto()
+
         underlying_attn_backend = get_attn_backend(
             head_size,
             dtype,
