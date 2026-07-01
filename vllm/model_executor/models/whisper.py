@@ -128,6 +128,10 @@ class WhisperEncoderAttention(MMEncoderAttention):
         # Call the parent forward method
         out = super().forward(query, key, value)
 
+        from vllm.v1.attention.backends._whisper_debug import check_output_nan
+
+        check_output_nan(".encoder.self_attn", "ENCODER", out)
+
         if is_2d:
             out = out.squeeze(0)
 

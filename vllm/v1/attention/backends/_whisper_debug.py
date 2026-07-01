@@ -120,6 +120,43 @@ def maybe_contig(t: object) -> object:
     return t
 
 
+def check_kv_nan(tag, key_cache, value_cache, block_table, seq_lens) -> None:
+    """Check whether the cross-attn KV cache blocks referenced by request 0
+    contain NaN/Inf. Bounded to the referenced blocks (capped) to avoid the
+    full-cache OOM. Distinguishes a poisoned cache (write-side) from a
+    kernel/read-side bug."""
+    key = "KVNAN:" + tag
+    if not _active() or _capturing():
+        return
+    n = _dump_counts.get(key, 0)
+    if n >= _MAX_DUMPS_PER_TAG:
+        return
+    _dump_counts[key] = n + 1
+    try:
+        if seq_lens.numel() == 0 or block_table.numel() == 0:
+            return
+        length = int(seq_lens[0].item())
+        if length <= 0:
+            return
+        block_size = key_cache.shape[1]
+        num_blocks = min((length + block_size - 1) // block_size, 128)
+        blk = block_table[0, :num_blocks].to(torch.long)
+        k = key_cache[blk]
+        v = value_cache[blk]
+        kn = bool(torch.isnan(k).any()) or bool(torch.isinf(k).any())
+        vn = bool(torch.isnan(v).any()) or bool(torch.isinf(v).any())
+        logger.warning(
+            "[whisper-dbg] %s KVcache nan/inf: k=%s v=%s (len=%d nblocks=%d)",
+            tag,
+            kn,
+            vn,
+            length,
+            num_blocks,
+        )
+    except Exception as e:  # never break the model for a diagnostic
+        logger.warning("[whisper-dbg] %s KV check error: %r", tag, e)
+
+
 def check_output_nan(layer_name: str, attn_type: str, output: object) -> None:
     """Per-layer probe: flag NaN/Inf in an attention layer's output."""
     global _nan_warns

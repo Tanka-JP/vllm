@@ -264,6 +264,8 @@ def test_parse_language_detection_output():
 @pytest.mark.parametrize("dtype", ["half", "float"])
 @pytest.mark.parametrize("num_logprobs", [5])
 @pytest.mark.parametrize("enforce_eager", [True, False])
+# DIAGNOSTIC: run V1 model runner first, then V2, to compare on identical HW.
+@pytest.mark.parametrize("use_v2_model_runner", [False, True])
 def test_models(
     hf_runner,
     vllm_runner,
@@ -272,10 +274,14 @@ def test_models(
     num_logprobs: int,
     input_audios,
     enforce_eager: bool,
+    use_v2_model_runner: bool,
+    monkeypatch,
 ) -> None:
     check_model_available(model)
     if current_platform.is_cpu() and not enforce_eager:
         pytest.skip("Skipping test for CPU with non-eager mode")
+    # Set before the engine (subprocess) is created so it is inherited.
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1" if use_v2_model_runner else "0")
     run_test(
         hf_runner,
         vllm_runner,
