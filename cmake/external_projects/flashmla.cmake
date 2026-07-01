@@ -44,7 +44,9 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.3 AND FLASH_MLA_ARCHS)
 
     set(FlashMLA_INCLUDES
         ${flashmla_SOURCE_DIR}/csrc/cutlass/include
-        ${flashmla_SOURCE_DIR}/csrc)
+        ${flashmla_SOURCE_DIR}/csrc
+        ${CUDAToolkit_INCLUDE_DIRS}
+        ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 
     set_gencode_flags_for_srcs(
         SRCS "${FlashMLA_SOURCES}"
@@ -64,4 +66,3 @@ else()
     # Create an empty target for setup.py when not targeting sm90a systems
     add_custom_target(_flashmla_C)
 endif()
-

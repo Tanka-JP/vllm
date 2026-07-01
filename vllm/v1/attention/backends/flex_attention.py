@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlexAttention."""
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -24,6 +25,15 @@ from vllm.v1.attention.backends.utils import (AttentionMetadataBuilder,
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
+
+
+def _batch_invariant_ops_enabled() -> bool:
+    return os.getenv("VLLM_BATCH_INVARIANT_OPS", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -451,9 +461,16 @@ class FlexAttentionMetadata:
                                             dim=0)
         used_pages_padded = used_pages_padded.reshape(
             used_pages_padded.shape[0] // self.q_block_size, -1)
-        used_pages_padded = used_pages_padded // page_to_block_ratio
-        kv_indices = unique_static_unsorted((used_pages_padded.long()),
-                                            M=self.num_blocks).to(torch.int32)
+        if _batch_invariant_ops_enabled():
+            used_pages_padded = used_pages_padded // page_to_block_ratio + 1
+            kv_indices = unique_static_unsorted((used_pages_padded.long()),
+                                                M=self.num_blocks).to(
+                                                    torch.int32) - 1
+        else:
+            used_pages_padded = used_pages_padded // page_to_block_ratio
+            kv_indices = unique_static_unsorted((used_pages_padded.long()),
+                                                M=self.num_blocks).to(
+                                                    torch.int32)
 
         kv_num_blocks = (kv_indices >= 0).sum(dim=-1).to(torch.int32)
         block_mask_kwargs = {
@@ -528,11 +545,16 @@ class FlexAttentionMetadataBuilder(
         self.headdim = self.model_config.get_head_size()
         self.block_size = kv_cache_spec.block_size
         self.kv_cache_spec = kv_cache_spec
-        self.direct_build: bool = is_torch_equal_or_newer("2.9.0.dev0")
-        self.q_block_size: int = 16 if is_torch_equal_or_newer(
-            "2.9.0.dev0") else 128
-        self.kv_block_size: int = 16 if is_torch_equal_or_newer(
-            "2.9.0.dev0") else 128
+        if _batch_invariant_ops_enabled():
+            self.direct_build = True
+            self.q_block_size = 16
+            self.kv_block_size = 16
+        else:
+            self.direct_build = is_torch_equal_or_newer("2.9.0.dev0")
+            self.q_block_size = 16 if is_torch_equal_or_newer(
+                "2.9.0.dev0") else 128
+            self.kv_block_size = 16 if is_torch_equal_or_newer(
+                "2.9.0.dev0") else 128
 
     def reorder_batch(self, input_batch: "InputBatch",
                       scheduler_output: "SchedulerOutput") -> bool:
@@ -773,6 +795,11 @@ def get_kernel_options(query, block_m, block_n,
     kernel_options: dict[str, Union[int, bool]] = {
         "FORCE_USE_FLEX_ATTENTION": True,
     }
+    if _batch_invariant_ops_enabled():
+        kernel_options["BLOCK_M"] = 16
+        kernel_options["BLOCK_N"] = 16
+        kernel_options["IS_DIVISIBLE"] = False
+        return kernel_options
     if use_direct_build:
         kernel_options["BLOCK_M"] = block_m
         kernel_options["BLOCK_N"] = block_n

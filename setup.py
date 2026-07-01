@@ -357,6 +357,82 @@ class precompiled_wheel_utils:
                 shutil.rmtree(temp_dir)
 
     @staticmethod
+    def extract_precompiled_flash_attn_and_patch_package(
+            wheel_url_or_path: str) -> dict:
+        """Extract only vllm-flash-attn binaries from a compatible vLLM wheel.
+
+        The Python wrapper is copied from the vllm-flash-attn source used by
+        this checkout so older fork-specific APIs stay intact.
+        """
+        import tempfile
+        import zipfile
+
+        temp_dir = None
+        try:
+            if not os.path.isfile(wheel_url_or_path):
+                wheel_filename = wheel_url_or_path.split("/")[-1]
+                temp_dir = tempfile.mkdtemp(prefix="vllm-fa-wheels")
+                wheel_path = os.path.join(temp_dir, wheel_filename)
+                print(f"Downloading flash-attn wheel from {wheel_url_or_path} "
+                      f"to {wheel_path}")
+                from urllib.request import urlretrieve
+                urlretrieve(wheel_url_or_path, filename=wheel_path)
+            else:
+                wheel_path = wheel_url_or_path
+                print(f"Using existing flash-attn wheel at {wheel_path}")
+
+            package_data_patch = {}
+
+            files_to_copy = [
+                "vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so",
+                "vllm/vllm_flash_attn/_vllm_fa3_C.abi3.so",
+            ]
+            with zipfile.ZipFile(wheel_path) as wheel:
+                for filename in files_to_copy:
+                    try:
+                        member = wheel.getinfo(filename)
+                    except KeyError:
+                        print(f"[warn] {filename} not found in {wheel_path}")
+                        continue
+                    print(f"[extract flash-attn] {member.filename}")
+                    target_path = os.path.join(".", member.filename)
+                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                    with wheel.open(member.filename) as src, open(
+                            target_path, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    pkg = os.path.dirname(member.filename).replace("/", ".")
+                    package_data_patch.setdefault(pkg, []).append(
+                        os.path.basename(member.filename))
+
+            flash_attn_src = os.getenv(
+                "VLLM_FLASH_ATTN_SRC_DIR",
+                os.path.join(ROOT_DIR, ".deps", "vllm-flash-attn-src",
+                             "vllm_flash_attn"))
+            if not os.path.isdir(flash_attn_src):
+                raise RuntimeError(
+                    "Cannot find vllm-flash-attn Python sources at "
+                    f"{flash_attn_src}. Set VLLM_FLASH_ATTN_SRC_DIR or run a "
+                    "normal build once to populate .deps.")
+
+            target_root = os.path.join(ROOT_DIR, "vllm", "vllm_flash_attn")
+            for src_path in Path(flash_attn_src).rglob("*.py"):
+                rel_path = src_path.relative_to(flash_attn_src)
+                dst_path = Path(target_root) / rel_path
+                os.makedirs(dst_path.parent, exist_ok=True)
+                shutil.copy2(src_path, dst_path)
+                filename = os.path.join("vllm", "vllm_flash_attn",
+                                        str(rel_path)).replace(os.sep, "/")
+                pkg = os.path.dirname(filename).replace("/", ".")
+                package_data_patch.setdefault(pkg, []).append(
+                    os.path.basename(filename))
+
+            return package_data_patch
+        finally:
+            if temp_dir is not None:
+                print(f"Removing temporary directory {temp_dir}")
+                shutil.rmtree(temp_dir)
+
+    @staticmethod
     def get_base_commit_in_main_branch() -> str:
         # Force to use the nightly wheel. This is mainly used for CI testing.
         if envs.VLLM_TEST_USE_PRECOMPILED_NIGHTLY_WHEEL:
@@ -606,6 +682,9 @@ def get_requirements() -> list[str]:
 
 
 ext_modules = []
+precompiled_flash_attn_package_data = {}
+precompiled_flash_attn_wheel = os.getenv(
+    "VLLM_PRECOMPILED_FLASH_ATTN_WHEEL_LOCATION")
 
 if _is_cuda() or _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._moe_C"))
@@ -614,11 +693,19 @@ if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
 if _is_cuda():
-    ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
+    if precompiled_flash_attn_wheel:
+        precompiled_flash_attn_package_data = (
+            precompiled_wheel_utils.
+            extract_precompiled_flash_attn_and_patch_package(
+                precompiled_flash_attn_wheel))
+    else:
+        ext_modules.append(
+            CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
     if envs.VLLM_USE_PRECOMPILED or get_nvcc_cuda_version() >= Version("12.3"):
         # FA3 requires CUDA 12.3 or later
-        ext_modules.append(
-            CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
+        if not precompiled_flash_attn_wheel:
+            ext_modules.append(
+                CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
         # Optional since this doesn't get built (produce an .so file) when
         # not targeting a hopper system
         ext_modules.append(
@@ -666,6 +753,10 @@ if envs.VLLM_USE_PRECOMPILED:
     patch = precompiled_wheel_utils.extract_precompiled_and_patch_package(
         wheel_url)
     for pkg, files in patch.items():
+        package_data.setdefault(pkg, []).extend(files)
+
+if precompiled_flash_attn_package_data:
+    for pkg, files in precompiled_flash_attn_package_data.items():
         package_data.setdefault(pkg, []).extend(files)
 
 if _no_device():

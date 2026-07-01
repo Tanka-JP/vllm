@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "dispatch_utils.h"
+#include "../../cub_compat.cuh"
 #include "../vectorization_utils.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/Exceptions.h>
@@ -116,7 +117,7 @@ __global__ void dynamic_per_token_scaled_fp8_quant_kernel_strided(
   using BlockReduce = cub::BlockReduce<float, 256>;
   __shared__ typename BlockReduce::TempStorage tmp;
   const float block_max =
-      BlockReduce(tmp).Reduce(absmax_val, cub::Max{}, blockDim.x);
+      BlockReduce(tmp).Reduce(absmax_val, cub_compat::Max{}, blockDim.x);
 
   __shared__ float token_scale;
   if (tid == 0) {

@@ -20,16 +20,19 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include "../cuda_compat.h"
+#include "../cub_compat.cuh"
 
 #ifndef USE_ROCM
     #include <cub/util_type.cuh>
     #include <cub/cub.cuh>
     #include <cuda/std/functional>
-    using AddOp = cuda::std::plus<float>;
+    using AddOp = vllm::cub_compat::Sum;
+    using MaxOp = vllm::cub_compat::Max;
 #else
     #include <hipcub/util_type.hpp>
     #include <hipcub/hipcub.hpp>
-    using AddOp = cub::Sum; 
+    using AddOp = cub::Sum;
+    using MaxOp = cub::Max;
 #endif
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
@@ -79,7 +82,7 @@ __launch_bounds__(TPB) __global__
         threadData = max(static_cast<float>(input[idx]), threadData);
     }
 
-    const float maxElem = BlockReduce(tmpStorage).Reduce(threadData, cub::Max());
+    const float maxElem = BlockReduce(tmpStorage).Reduce(threadData, MaxOp());
     if (threadIdx.x == 0)
     {
         float_max = maxElem;

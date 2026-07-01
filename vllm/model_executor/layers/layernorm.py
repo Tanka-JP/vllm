@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom normalization layers."""
+import os
 from typing import Optional, Union
 
 import torch
@@ -9,6 +10,14 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
+
+
+def _batch_invariant_ops_enabled() -> bool:
+    return os.getenv("VLLM_BATCH_INVARIANT_OPS", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
 
 def is_rocm_aiter_rmsnorm_enabled() -> bool:
@@ -158,7 +167,8 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        if self.variance_size_override is not None:
+        if (self.variance_size_override is not None
+                or _batch_invariant_ops_enabled()):
             return self.forward_native(x, residual)
 
         add_residual = residual is not None
