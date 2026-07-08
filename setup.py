@@ -207,6 +207,26 @@ class cmake_build_ext(build_ext):
         # Make sure we use the nvcc from CUDA_HOME
         if _is_cuda():
             cmake_args += [f'-DCMAKE_CUDA_COMPILER={CUDA_HOME}/bin/nvcc']
+            cuda_toolkit_root = (os.environ.get("CUDA_TOOLKIT_ROOT_DIR")
+                                 or os.environ.get("CUDAToolkit_ROOT")
+                                 or CUDA_HOME)
+            if cuda_toolkit_root:
+                cmake_args += [
+                    f'-DCUDA_TOOLKIT_ROOT_DIR={cuda_toolkit_root}',
+                    f'-DCUDAToolkit_ROOT={cuda_toolkit_root}',
+                ]
+                target_include = os.path.join(
+                    cuda_toolkit_root, "targets", "x86_64-linux", "include")
+                target_lib = os.path.join(
+                    cuda_toolkit_root, "targets", "x86_64-linux", "lib")
+                if os.path.isdir(target_include):
+                    cmake_args += [
+                        f'-DCUDA_TOOLKIT_TARGET_DIR={os.path.dirname(target_include)}',
+                        f'-DCUDA_TOOLKIT_INCLUDE={target_include}',
+                        f'-DCUDA_INCLUDE_DIRS={target_include}',
+                    ]
+                if os.path.isdir(target_lib):
+                    cmake_args += [f'-DCUDA_CUDART_LIBRARY={target_lib}/libcudart.so']
         subprocess.check_call(
             ['cmake', ext.cmake_lists_dir, *build_tool, *cmake_args],
             cwd=self.build_temp)

@@ -28,19 +28,129 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs import StepAudio2EncoderConfig
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 
-from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
-from .utils import (flatten_bn, init_vllm_registered_model, maybe_prefix,
-                    merge_multimodal_embeddings)
+from .interfaces import (MultiModalEmbeddings, SupportsLoRA,
+                         SupportsMultiModal, SupportsPP)
+from .module_mapping import MultiModelKeys
+from .utils import (WeightsMapper, flatten_bn, init_vllm_registered_model,
+                    maybe_prefix, merge_multimodal_embeddings)
 
+AUDIO_START_TOKEN_ID = 151688
 AUDIO_PATCH_TOKEN_ID = 151690
 
 
+_MEL_FILTERS_CACHE: dict[tuple[int, str], torch.Tensor] = {}
+
+
+def _stepaudio_mel_feature_len(num_samples: int) -> int:
+    # Native log_mel_spectrogram pads by 479 samples, torch.stft(center=True)
+    # yields floor((N + 479) / 160) + 1 frames, then drops the final frame.
+    return (int(num_samples) + 479) // 160
+
+
+def _stepaudio_mel_filters(n_mels: int, device: torch.device) -> torch.Tensor:
+    key = (n_mels, str(device))
+    cached = _MEL_FILTERS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    filters = torch.from_numpy(
+        librosa.filters.mel(sr=16000, n_fft=400, n_mels=n_mels)
+    ).to(device=device)
+    _MEL_FILTERS_CACHE[key] = filters
+    return filters
+
+
+def _stepaudio_log_mel_spectrogram(
+    audio: torch.Tensor,
+    n_mels: int = 128,
+    padding: int = 479,
+) -> torch.Tensor:
+    # Match cbhua native eval: waveform is moved to CUDA first, log-mel is
+    # computed in float32 on that device, then the model casts the mel to bf16.
+    audio = audio.float()
+    if padding > 0:
+        audio = F.pad(audio, (0, padding))
+    window = torch.hann_window(400).to(audio.device)
+    stft = torch.stft(audio, 400, 160, window=window, return_complex=True)
+    magnitudes = stft[..., :-1].abs() ** 2
+    filters = _stepaudio_mel_filters(n_mels, audio.device)
+    mel_spec = filters @ magnitudes
+
+    log_spec = torch.clamp(mel_spec, min=1e-10).log10()
+    log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
+    log_spec = (log_spec + 4.0) / 4.0
+    return log_spec
+
+
+def _flatten_stepaudio_embeddings(
+    multimodal_embeddings: NestedTensors,
+) -> list[torch.Tensor]:
+    if isinstance(multimodal_embeddings, torch.Tensor):
+        return [multimodal_embeddings]
+
+    flattened: list[torch.Tensor] = []
+    for item in multimodal_embeddings:
+        flattened.extend(_flatten_stepaudio_embeddings(item))
+    return flattened
+
+
+def _merge_stepaudio_audio_embeddings(
+    input_ids: torch.Tensor,
+    inputs_embeds: torch.Tensor,
+    multimodal_embeddings: MultiModalEmbeddings,
+) -> torch.Tensor:
+    audio_embeddings = _flatten_stepaudio_embeddings(multimodal_embeddings)
+
+    if input_ids.ndim == 1:
+        starts = torch.nonzero(input_ids == AUDIO_START_TOKEN_ID,
+                               as_tuple=False).flatten()
+        if starts.numel() != len(audio_embeddings):
+            raise ValueError(
+                "StepAudio audio embedding count does not match "
+                f"<audio_start> count: {len(audio_embeddings)} vs "
+                f"{starts.numel()}")
+        for start, audio in zip(starts.tolist(), audio_embeddings):
+            pos = int(start) + 1
+            end = pos + audio.shape[0]
+            if end > inputs_embeds.shape[0]:
+                raise ValueError("StepAudio audio embeddings exceed prompt")
+            inputs_embeds[pos:end] = audio.to(device=inputs_embeds.device,
+                                              dtype=inputs_embeds.dtype)
+        return inputs_embeds
+
+    if input_ids.ndim == 2:
+        cursor = 0
+        for batch_idx in range(input_ids.shape[0]):
+            starts = torch.nonzero(input_ids[batch_idx] ==
+                                   AUDIO_START_TOKEN_ID,
+                                   as_tuple=False).flatten()
+            for start in starts.tolist():
+                if cursor >= len(audio_embeddings):
+                    raise ValueError("StepAudio missing audio embeddings")
+                audio = audio_embeddings[cursor]
+                cursor += 1
+                pos = int(start) + 1
+                end = pos + audio.shape[0]
+                if end > inputs_embeds.shape[1]:
+                    raise ValueError(
+                        "StepAudio audio embeddings exceed prompt")
+                inputs_embeds[batch_idx, pos:end] = audio.to(
+                    device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        if cursor != len(audio_embeddings):
+            raise ValueError("StepAudio unused audio embeddings")
+        return inputs_embeds
+
+    raise ValueError(f"Unsupported StepAudio input_ids shape: {input_ids.shape}")
+
+
 class Step1fAudioInputs(TypedDict):
-    audio_mels: torch.Tensor
-    """Shape: `(num_audios * num_frames, num_mel_bins)`"""
+    audio_waveforms: list[torch.Tensor]
+    """Raw 16 kHz mono waveforms, one tensor per audio item."""
 
     audio_lens: list[int]
-    """Shape: `(num_audios,)`"""
+    """Log-mel frame lengths, one int per audio item."""
+
+    audio_mels: Optional[torch.Tensor]
+    """Legacy CPU-mel fallback, shape `(batch, frames, n_mels)`."""
 
 
 class Step1fProcessor:
@@ -90,9 +200,15 @@ class Step1fProcessor:
     def preprocess_audio(self, audio_tensor: np.ndarray) -> torch.Tensor:
         return self._log_mel_spectrogram(audio_tensor, padding=479)
 
+    def get_audio_feature_len(self, audio_tensor: np.ndarray) -> int:
+        return _stepaudio_mel_feature_len(len(audio_tensor))
+
     def get_num_audio_tokens(self, max_feature_len: int) -> int:
+        # Native prompt construction uses compute_token_num(), which subtracts
+        # two frames before estimating how many <audio_patch> tokens to render.
+        native_feature_len = max_feature_len - 2
         encoder_output_dim = (
-            max_feature_len +
+            native_feature_len +
             1) // 2 // 2  # from hych: align with log-to-mel padding 479
         padding = 1
         kernel_size = 3
@@ -101,17 +217,34 @@ class Step1fProcessor:
                               kernel_size) // stride + 1
         return adapter_output_dim
 
+    def get_num_audio_embeddings(self, max_feature_len: int) -> int:
+        # This mirrors AudioEncoder.forward() + the adaptor length adjustment in
+        # StepAudio2ForCausalLM.forward(). Native HF writes this many embeddings
+        # starting immediately after <audio_start>; when it is one longer than
+        # get_num_audio_tokens(), the final embedding lands on <audio_end>.
+        encoder_output_dim = (max_feature_len + 1) // 2 // 2
+        return (encoder_output_dim - 1) // 2 + 1
+
     def _get_audio_repl(
         self,
         audio_feat_len: int,
-    ) -> tuple[str, list[int]]:
+    ) -> tuple[str, list[int], list[bool]]:
         num_audio_tokens = self.get_num_audio_tokens(audio_feat_len)
+        num_audio_embeddings = self.get_num_audio_embeddings(audio_feat_len)
+        if not (num_audio_tokens <= num_audio_embeddings <= num_audio_tokens + 1):
+            raise ValueError(
+                "Unexpected StepAudio audio length relation: "
+                f"patch_tokens={num_audio_tokens}, embeddings={num_audio_embeddings}"
+            )
         text = "<audio_start>" + "<audio_patch>" * num_audio_tokens + "<audio_end>"  # noqa: E501
         token_ids = [self.tokenizer.convert_tokens_to_ids("<audio_start>")
                      ] + [self.audio_token_id] * num_audio_tokens + [
                          self.tokenizer.convert_tokens_to_ids("<audio_end>")
                      ]
-        return text, token_ids
+        embed_mask = [False] + [True] * num_audio_tokens + [
+            num_audio_embeddings > num_audio_tokens
+        ]
+        return text, token_ids, embed_mask
 
     def replace_placeholder(self, text: str, placeholder: str,
                             repls: list[str]) -> str:
@@ -149,21 +282,28 @@ class Step1fProcessor:
             audio_inputs = {}
             text_inputs = self.tokenizer(text)
         else:
-            audio_mels_lst = []
+            audio_waveforms_lst = []
+            audio_waveform_lens = []
+            audio_lens = []
             audio_repl_str_lst = []
             audio_repl_ids_lst = []
             for audio in audios:
-                audio_mels = self.preprocess_audio(audio)
-                audio_mels_lst.append(audio_mels)
-                audio_repl_str, audio_repl_ids = self._get_audio_repl(
-                    audio_mels.shape[0])
+                audio = audio.astype(np.float32, copy=False)
+                audio_waveforms_lst.append(torch.from_numpy(audio))
+                audio_waveform_lens.append(len(audio))
+                audio_feat_len = self.get_audio_feature_len(audio)
+                audio_lens.append(audio_feat_len)
+                audio_repl_str, audio_repl_ids, _ = self._get_audio_repl(
+                    audio_feat_len)
                 audio_repl_str_lst.append(audio_repl_str)
                 audio_repl_ids_lst.extend(audio_repl_ids)
             audio_inputs = {
-                "audio_mels":
-                torch.concat(audio_mels_lst),
+                "audio_waveforms":
+                torch.concat(audio_waveforms_lst),
+                "audio_waveform_lens":
+                audio_waveform_lens,
                 "audio_lens":
-                [audio_mels.shape[0] for audio_mels in audio_mels_lst]
+                audio_lens,
             }
 
             text = [
@@ -201,9 +341,9 @@ class Step1fAudioProcessingInfo(BaseProcessingInfo):
         max_audio_length = int(hf_processor.sampling_rate *
                                hf_processor.max_chunk_size)
         dummy_audio_tensor = np.zeros(max_audio_length, dtype=np.float32)
-        dummy_audio_mels = hf_processor.preprocess_audio(dummy_audio_tensor)
+        dummy_audio_len = hf_processor.get_audio_feature_len(dummy_audio_tensor)
         num_audio_tokens = len(
-            hf_processor._get_audio_repl(dummy_audio_mels.shape[0])[1])
+            hf_processor._get_audio_repl(dummy_audio_len)[1])
         return {"audio": num_audio_tokens}
 
     def get_num_mm_tokens(self, mm_data: MultiModalDataDict) -> int:
@@ -235,9 +375,9 @@ class Step1fAudioProcessingInfo(BaseProcessingInfo):
                 # Assume it's already a numpy array at 16000Hz
                 audio_array = audio
 
-            audio_mels = hf_processor.preprocess_audio(audio_array)
+            audio_feat_len = hf_processor.get_audio_feature_len(audio_array)
             audio_repl_ids = hf_processor._get_audio_repl(
-                audio_mels.shape[0])[1]
+                audio_feat_len)[1]
             total_tokens += len(audio_repl_ids)
 
         return total_tokens
@@ -319,10 +459,13 @@ class Step1fAudioMultiModalProcessor(
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
         audio_lens = hf_inputs.get("audio_lens", torch.empty(0))
+        audio_waveform_lens = hf_inputs.get("audio_waveform_lens",
+                                            torch.empty(0))
 
         return dict(
-            audio_mels=MultiModalFieldConfig.flat_from_sizes(
-                "audio", audio_lens),
+            audio_waveforms=MultiModalFieldConfig.flat_from_sizes(
+                "audio", audio_waveform_lens),
+            audio_waveform_lens=MultiModalFieldConfig.batched("audio"),
             audio_lens=MultiModalFieldConfig.batched("audio"),
         )
 
@@ -340,11 +483,14 @@ class Step1fAudioMultiModalProcessor(
         def get_replacement_step_audio(item_idx: int):
             batched_audio_lens = out_mm_data.get("audio_lens").tolist()
             num_feature_len = batched_audio_lens[item_idx]
-            audio_repl_ids = processor._get_audio_repl(num_feature_len)[1]
+            audio_repl_ids, embed_mask = processor._get_audio_repl(num_feature_len)[1:]
 
-            return PromptUpdateDetails.select_token_id(
-                seq=audio_repl_ids,
-                embed_token_id=audio_token_id,
+            def is_embed(tokenizer, full, embed_mask=tuple(embed_mask)):
+                return torch.tensor(embed_mask, dtype=torch.bool)
+
+            return PromptUpdateDetails(
+                full=audio_repl_ids,
+                is_embed=is_embed,
             )
 
         return [
@@ -555,7 +701,21 @@ class StepASREncoder(nn.Module):
     Step1fAudioMultiModalProcessor,
     info=Step1fAudioProcessingInfo,
     dummy_inputs=Step1fAudioDummyInputsBuilder)
-class StepAudio2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
+class StepAudio2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP,
+                            SupportsLoRA):
+
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
+    # LoRA adapters trained with PEFT name language-model modules as
+    # `model.layers...` / `lm_head...`; map them onto the wrapped
+    # `language_model` submodule. The LoRA loader reads this mapper.
+    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={
+        "model.": "language_model.model.",
+        "lm_head.": "language_model.lm_head.",
+    })
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> Optional[str]:
@@ -591,6 +751,16 @@ class StepAudio2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors)
 
+    def get_mm_mapping(self) -> MultiModelKeys:
+        """
+        Get the module prefix in multimodal models
+        """
+        return MultiModelKeys.from_string_field(
+            language_model="language_model.",
+            connector="adapter.",
+            tower_model="encoder.",
+        )
+
     @cached_property
     def sampler(self):
         if hasattr(self.language_model, "sampler"):
@@ -608,8 +778,31 @@ class StepAudio2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
     def _parse_and_validate_audio_input(
             self, **kwargs: object) -> Optional[Step1fAudioInputs]:
+        audio_waveforms = kwargs.pop("audio_waveforms", None)
+        audio_waveform_lens = kwargs.pop("audio_waveform_lens", None)
         audio_mels = kwargs.pop("audio_mels", None)
         audio_lens = kwargs.pop("audio_lens", None)
+
+        if audio_waveforms is not None:
+            audio_waveforms = flatten_bn(audio_waveforms, concat=True)
+            audio_waveform_lens = flatten_bn(audio_waveform_lens,
+                                             concat=True).tolist()
+            audio_lens = flatten_bn(audio_lens, concat=True).tolist()
+
+            waveforms = []
+            cur_idx = 0
+            for wav_len in audio_waveform_lens:
+                wav_len = int(wav_len)
+                waveforms.append(
+                    audio_waveforms[cur_idx:cur_idx + wav_len].to(
+                        device=self.device, dtype=torch.float32))
+                cur_idx += wav_len
+
+            return Step1fAudioInputs(
+                audio_waveforms=waveforms,
+                audio_lens=[int(x) for x in audio_lens],
+                audio_mels=None,
+            )
 
         if audio_mels is None:
             return None
@@ -629,18 +822,31 @@ class StepAudio2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             dim=0)
 
         return Step1fAudioInputs(
+            audio_waveforms=[],
+            audio_lens=[int(x) for x in audio_lens],
             audio_mels=audio_mels.to(self.dtype).to(self.device),
-            audio_lens=audio_lens,
         )
 
     def _process_audio_input(
             self, audio_input: Step1fAudioInputs) -> tuple[torch.Tensor, ...]:
-        audio_mels = audio_input["audio_mels"]
-        audio_lens = torch.tensor(audio_input["audio_lens"],
-                                  device=self.device)
+        audio_mels = audio_input.get("audio_mels")
 
-        audio_mels = audio_mels.permute(0, 2,
-                                        1)  # (B, T, n_mels) -> (B, n_mels, T)
+        if audio_mels is None:
+            mel_list = [
+                _stepaudio_log_mel_spectrogram(wav, n_mels=128).to(self.dtype)
+                for wav in audio_input["audio_waveforms"]
+            ]
+            audio_lens = torch.tensor([mel.shape[-1] for mel in mel_list],
+                                      device=self.device)
+            max_len = max(mel.shape[-1] for mel in mel_list)
+            audio_mels = torch.stack(
+                [F.pad(mel, (0, max_len - mel.shape[-1])) for mel in mel_list],
+                dim=0)
+        else:
+            audio_lens = torch.tensor(audio_input["audio_lens"],
+                                      device=self.device)
+            audio_mels = audio_mels.permute(
+                0, 2, 1)  # (B, T, n_mels) -> (B, n_mels, T)
 
         audio_features, audio_lens = self.encoder(audio_mels, audio_lens)
         audio_features = self.adapter(audio_features)
@@ -671,9 +877,8 @@ class StepAudio2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         inputs_embeds = self.language_model.model.get_input_embeddings(
             input_ids)
         if multimodal_embeddings is not None:
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids, inputs_embeds, multimodal_embeddings,
-                AUDIO_PATCH_TOKEN_ID)
+            inputs_embeds = _merge_stepaudio_audio_embeddings(
+                input_ids, inputs_embeds, multimodal_embeddings)
         return inputs_embeds
 
     def forward(
