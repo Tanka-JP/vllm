@@ -33,11 +33,14 @@ from vllm.tokenizers import TokenizerLike
 
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
+    SupportsLoRA,
     SupportsMultiModal,
     SupportsPP,
 )
+from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
+    WeightsMapper,
     flatten_bn,
     init_vllm_registered_model,
     maybe_prefix,
@@ -578,7 +581,22 @@ class Adaptor(nn.Module):
     info=Step1fAudioProcessingInfo,
     dummy_inputs=Step1fAudioDummyInputsBuilder,
 )
-class StepAudio2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
+class StepAudio2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
+    # PEFT adapters name language-model modules `model.layers...` /
+    # `lm_head...`; the LoRA loader uses this mapper to place them onto
+    # the wrapped `language_model` submodule.
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.": "language_model.model.",
+            "lm_head.": "language_model.lm_head.",
+        }
+    )
+
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> Optional[str]:
         if modality.startswith("audio"):
@@ -616,6 +634,14 @@ class StepAudio2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
+        )
+
+    def get_mm_mapping(self) -> MultiModelKeys:
+        """Get the module prefix in multimodal models."""
+        return MultiModelKeys.from_string_field(
+            language_model="language_model.",
+            connector="adapter.",
+            tower_model="encoder.",
         )
 
     @property
