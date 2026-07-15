@@ -55,4 +55,11 @@ if [[ "${ENFORCE_EAGER:-1}" == "1" ]]; then
   args+=(--enforce-eager)
 fi
 
+if [[ "${ENABLE_TAG_BIAS_PROCESSOR:-1}" == "1" ]]; then
+  args+=(
+    --logits-processors
+    "vllm.plugins.stepaudio_vllm24.logits_processor:StepAudioTagBiasLogitsProcessor"
+  )
+fi
+
 exec "$UV_BIN" run --project "$REPO_ROOT" "${args[@]}"
