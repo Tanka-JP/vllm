@@ -44,6 +44,14 @@ MAX_NUM_SEQS=16 GPU_MEMORY_UTILIZATION=0.70 examples/stepaudio_vllm24/serve_step
 VLLM_BATCH_INVARIANT=1 examples/stepaudio_vllm24/serve_stepaudio.sh
 ```
 
+Tag precision/recall steering:
+
+The server helper registers a request-scoped StepAudio tag-presence logits
+processor. Requests without steering arguments remain a no-op; pass a bias in
+`vllm_xargs` to move the operating point toward precision or recall. See
+[TAG_BIAS.md](./TAG_BIAS.md) for the API, per-family controls, LoRA interaction,
+and validation commands.
+
 Runtime verification:
 
 ```bash
