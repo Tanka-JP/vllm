@@ -89,7 +89,9 @@ def main() -> int:
     parser.add_argument("--server-url", default="http://127.0.0.1:8010/v1")
     parser.add_argument("--model", default="stepaudio-v25-c0-ep3")
     parser.add_argument("--native-src", default="/data/cbhua/step-audio-finetune/src")
-    parser.add_argument("--native-checkpoint", default="/data/liujun/stepaudio-merged/v25_C0_ep3")
+    parser.add_argument(
+        "--native-checkpoint", default="/data/liujun/stepaudio-merged/v25_C0_ep3"
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--timeout-s", type=float, default=180.0)

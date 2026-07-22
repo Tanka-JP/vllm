@@ -121,7 +121,9 @@ def main() -> int:
     parser.add_argument("--server-url", default="http://127.0.0.1:8010/v1")
     parser.add_argument("--model", default="stepaudio-v25-c0-ep3")
     parser.add_argument("--native-src", default="/data/cbhua/step-audio-finetune/src")
-    parser.add_argument("--native-checkpoint", default="/data/liujun/stepaudio-merged/v25_C0_ep3")
+    parser.add_argument(
+        "--native-checkpoint", default="/data/liujun/stepaudio-merged/v25_C0_ep3"
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--top-k", type=int, default=20)
@@ -194,7 +196,9 @@ def main() -> int:
             if not exact and common < len(native_ids) and common < len(vllm_ids):
                 common_ids = native_ids[:common]
                 common_text = tokenizer.decode(common_ids, skip_special_tokens=False)
-                retokenized = tokenizer(common_text, add_special_tokens=False)["input_ids"]
+                retokenized = tokenizer(common_text, add_special_tokens=False)[
+                    "input_ids"
+                ]
                 native_next_id = int(native_ids[common])
                 vllm_next_id = int(vllm_ids[common])
 
@@ -221,7 +225,9 @@ def main() -> int:
                 wav_t = torch.from_numpy(wav).to(device)
                 mel = _modeling_helpers.log_mel_spectrogram(wav_t).to(runner.dtype)
                 wavs = mel.unsqueeze(0)
-                wav_lens = torch.tensor([mel.shape[-1]], dtype=torch.long, device=device)
+                wav_lens = torch.tensor(
+                    [mel.shape[-1]], dtype=torch.long, device=device
+                )
                 with torch.inference_mode():
                     out = runner.model(
                         input_ids=ctx_ids,
@@ -254,11 +260,15 @@ def main() -> int:
                     "common_prefix_retokenizes_exact": retokenized == common_ids,
                     "native_next": {
                         "token_id": native_next_id,
-                        "token": tokenizer.decode([native_next_id], skip_special_tokens=False),
+                        "token": tokenizer.decode(
+                            [native_next_id], skip_special_tokens=False
+                        ),
                     },
                     "vllm_next": {
                         "token_id": vllm_next_id,
-                        "token": tokenizer.decode([vllm_next_id], skip_special_tokens=False),
+                        "token": tokenizer.decode(
+                            [vllm_next_id], skip_special_tokens=False
+                        ),
                     },
                     "native_top_logprobs": native_top,
                     "native_candidate_logprobs": native_candidate_logprobs,

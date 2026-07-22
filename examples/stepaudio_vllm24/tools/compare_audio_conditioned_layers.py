@@ -326,13 +326,21 @@ def _hf_eager_attention(
     v: torch.Tensor,
 ) -> torch.Tensor:
     seq_len = q.shape[0]
-    q_states = q.view(seq_len, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
-    k_states = k.view(seq_len, self.num_kv_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
-    v_states = v.view(seq_len, self.num_kv_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
+    q_states = (
+        q.view(seq_len, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
+    )
+    k_states = (
+        k.view(seq_len, self.num_kv_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
+    )
+    v_states = (
+        v.view(seq_len, self.num_kv_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
+    )
     n_rep = self.num_heads // self.num_kv_heads
     k_states = _repeat_kv(k_states, n_rep)
     v_states = _repeat_kv(v_states, n_rep)
-    attn_weights = torch.matmul(q_states, k_states.transpose(2, 3)).float() * self.scaling
+    attn_weights = (
+        torch.matmul(q_states, k_states.transpose(2, 3)).float() * self.scaling
+    )
     causal_mask = torch.triu(
         torch.ones(seq_len, seq_len, dtype=torch.bool, device=q.device),
         diagonal=1,
@@ -351,9 +359,15 @@ def _hf_sdpa_attention(
     backend: str = "auto",
 ) -> torch.Tensor:
     seq_len = q.shape[0]
-    q_states = q.view(seq_len, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
-    k_states = k.view(seq_len, self.num_kv_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
-    v_states = v.view(seq_len, self.num_kv_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
+    q_states = (
+        q.view(seq_len, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
+    )
+    k_states = (
+        k.view(seq_len, self.num_kv_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
+    )
+    v_states = (
+        v.view(seq_len, self.num_kv_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
+    )
     backend_flags = {
         "auto": (True, True, True, True),
         "math": (False, True, False, False),
@@ -361,7 +375,9 @@ def _hf_sdpa_attention(
         "mem_efficient": (False, False, True, False),
         "cudnn": (False, False, False, True),
     }
-    enable_flash, enable_math, enable_mem_efficient, enable_cudnn = backend_flags[backend]
+    enable_flash, enable_math, enable_mem_efficient, enable_cudnn = backend_flags[
+        backend
+    ]
     sdp_context = (
         contextlib.nullcontext()
         if backend == "auto"
@@ -455,7 +471,9 @@ def _hf_style_rope(
     return q_out.contiguous(), k_out.contiguous()
 
 
-def _install_native_sublayer_hooks(model: torch.nn.Module) -> tuple[dict[str, torch.Tensor], list[Any]]:
+def _install_native_sublayer_hooks(
+    model: torch.nn.Module,
+) -> tuple[dict[str, torch.Tensor], list[Any]]:
     from transformers.models.qwen2 import modeling_qwen2  # noqa: PLC0415
 
     store: dict[str, torch.Tensor] = {}
@@ -539,7 +557,9 @@ def _install_native_sublayer_hooks(model: torch.nn.Module) -> tuple[dict[str, to
 
     hooks.append(layer.register_forward_pre_hook(pre_hook))
     hooks.append(layer.register_forward_hook(layer_hook))
-    layer.self_attn.forward = types.MethodType(wrapped_self_attn_forward, layer.self_attn)
+    layer.self_attn.forward = types.MethodType(
+        wrapped_self_attn_forward, layer.self_attn
+    )
     hooks.append(RestoreForward())
     for name, module in [
         ("input_layernorm", layer.input_layernorm),
@@ -696,14 +716,18 @@ def _install_vllm_layer_hooks(
                 )
                 _record_vllm_sublayer("post_attention_layernorm", hidden_states)
                 hidden_states = self.mlp(hidden_states)
-                post = hidden_states + residual if residual is not None else hidden_states
+                post = (
+                    hidden_states + residual if residual is not None else hidden_states
+                )
                 _record_vllm_sublayer("layer_output", post)
                 pass_idx = TRACE_STATE["pass_idx"]
                 TRACE[pass_idx][layer_idx] = post[-1].detach().cpu().float()
                 TRACE_SHAPES[pass_idx][layer_idx] = tuple(post.shape)
                 TRACE_STATE["current_layer"] = None
                 return hidden_states, residual
-        out_hidden, out_residual = orig_forward(self, positions, hidden_states, residual)
+        out_hidden, out_residual = orig_forward(
+            self, positions, hidden_states, residual
+        )
         post = out_hidden + out_residual if out_residual is not None else out_hidden
         if layer_idx >= 0:
             pass_idx = TRACE_STATE["pass_idx"]
@@ -750,12 +774,16 @@ def _native_hidden_dump(
 
     dtype = torch.bfloat16
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        trust_remote_code=True,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-    ).to(device).eval()
+    model = (
+        AutoModelForCausalLM.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+        )
+        .to(device)
+        .eval()
+    )
     native_sublayers: dict[str, torch.Tensor] = {}
     native_hooks: list[Any] = []
     if trace_sublayers:
@@ -806,8 +834,7 @@ def _native_hidden_dump(
     logits_last = out.logits[0, -1].detach().cpu().float()
     candidate_ids = [int(native_ids[common]), int(vllm_ids[common])]
     candidate_logits = {
-        str(token_id): float(logits_last[token_id].item())
-        for token_id in candidate_ids
+        str(token_id): float(logits_last[token_id].item()) for token_id in candidate_ids
     }
     top = torch.topk(logits_last, k=8)
     report = {
@@ -819,11 +846,15 @@ def _native_hidden_dump(
         "common_prefix_text": common_text,
         "native_next": {
             "token_id": int(native_ids[common]),
-            "token": tokenizer.decode([int(native_ids[common])], skip_special_tokens=False),
+            "token": tokenizer.decode(
+                [int(native_ids[common])], skip_special_tokens=False
+            ),
         },
         "vllm_next": {
             "token_id": int(vllm_ids[common]),
-            "token": tokenizer.decode([int(vllm_ids[common])], skip_special_tokens=False),
+            "token": tokenizer.decode(
+                [int(vllm_ids[common])], skip_special_tokens=False
+            ),
         },
         "native_candidate_logits": candidate_logits,
         "native_top8": [
@@ -916,7 +947,9 @@ def _vllm_hidden_dump(
 
     # Use the exact instruction string from the native package when available.
     try:
-        from step_audio_finetune.prompt import v5_v2three_thinking_instruction  # type: ignore
+        from step_audio_finetune.prompt import (
+            v5_v2three_thinking_instruction,  # type: ignore
+        )
 
         messages[0]["content"] = v5_v2three_thinking_instruction({})
     except Exception:
@@ -986,14 +1019,24 @@ def _vllm_hidden_dump(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--parity-jsonl", type=Path, default=Path("/data/liujun/tmp/stepaudio-vllm24_parity_20_rerun_current.jsonl"))
+    parser.add_argument(
+        "--parity-jsonl",
+        type=Path,
+        default=Path("/data/liujun/tmp/stepaudio-vllm24_parity_20_rerun_current.jsonl"),
+    )
     parser.add_argument("--audio", type=Path)
-    parser.add_argument("--model-path", default="/data/liujun/stepaudio-merged/v25_C0_ep3")
+    parser.add_argument(
+        "--model-path", default="/data/liujun/stepaudio-merged/v25_C0_ep3"
+    )
     parser.add_argument("--served-model-name", default="stepaudio-v25-c0-ep3")
     parser.add_argument("--native-src", default="/data/cbhua/step-audio-finetune/src")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.55)
-    parser.add_argument("--out-json", type=Path, default=Path("/data/liujun/tmp/stepaudio-vllm24_layer_probe.json"))
+    parser.add_argument(
+        "--out-json",
+        type=Path,
+        default=Path("/data/liujun/tmp/stepaudio-vllm24_layer_probe.json"),
+    )
     parser.add_argument("--native-only", action="store_true")
     parser.add_argument("--native-pt-out", type=Path)
     parser.add_argument("--native-pt-in", type=Path)
@@ -1040,7 +1083,9 @@ def main() -> int:
                         native.get("layer0_sublayers", {}).keys()
                     ),
                     "layer0_weights": sorted(native.get("layer0_weights", {}).keys()),
-                    "native_pt_out": str(args.native_pt_out) if args.native_pt_out else None,
+                    "native_pt_out": str(args.native_pt_out)
+                    if args.native_pt_out
+                    else None,
                 },
                 ensure_ascii=False,
             )
@@ -1074,10 +1119,12 @@ def main() -> int:
     for layer in range(max_layer + 1):
         if layer not in layer_hidden:
             continue
-        layer_rows.append({
-            "layer": layer,
-            **_stats(native_hidden[layer + 1], layer_hidden[layer]),
-        })
+        layer_rows.append(
+            {
+                "layer": layer,
+                **_stats(native_hidden[layer + 1], layer_hidden[layer]),
+            }
+        )
     final_stats = None
     if vllm.get("final_hidden_last") is not None:
         final_stats = _stats(native_hidden[-1], vllm.pop("final_hidden_last"))
@@ -1093,7 +1140,9 @@ def main() -> int:
         ordered_names = [name for name in LAYER0_SUBLAYER_ORDER if name in shared]
         ordered_names.extend(sorted(shared - set(ordered_names)))
         for name in ordered_names:
-            sublayer_rows.append({"name": name, **_stats(native_sublayers[name], vllm_sublayers[name])})
+            sublayer_rows.append(
+                {"name": name, **_stats(native_sublayers[name], vllm_sublayers[name])}
+            )
         first_large_sublayer = next(
             (row for row in sublayer_rows if float(row["max_abs"]) > 1e-2),
             None,

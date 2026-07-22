@@ -30,7 +30,9 @@ def _module_report(name: str) -> dict[str, object]:
     }
 
 
-def _source_hit_report(package_root: Path, rel_path: str, needles: list[str]) -> dict[str, object]:
+def _source_hit_report(
+    package_root: Path, rel_path: str, needles: list[str]
+) -> dict[str, object]:
     path = package_root / rel_path
     if not path.exists():
         return {"exists": False, "path": str(path), "hits": {}}
@@ -87,7 +89,11 @@ def _check_cuda_matmul() -> dict[str, object]:
     y = torch.randn((64, 64), device="cuda", dtype=torch.float16)
     z = x @ y
     torch.cuda.synchronize()
-    return {"shape": list(z.shape), "dtype": str(z.dtype), "finite": bool(torch.isfinite(z).all())}
+    return {
+        "shape": list(z.shape),
+        "dtype": str(z.dtype),
+        "finite": bool(torch.isfinite(z).all()),
+    }
 
 
 def _check_rms_norm() -> dict[str, object]:
@@ -98,7 +104,11 @@ def _check_rms_norm() -> dict[str, object]:
     out = torch.empty_like(x)
     ops.rms_norm(out, x, w, 1e-6)
     torch.cuda.synchronize()
-    return {"shape": list(out.shape), "dtype": str(out.dtype), "finite": bool(torch.isfinite(out).all())}
+    return {
+        "shape": list(out.shape),
+        "dtype": str(out.dtype),
+        "finite": bool(torch.isfinite(out).all()),
+    }
 
 
 def _check_flash_attn(fa_version: int) -> dict[str, object]:
@@ -121,21 +131,28 @@ def _check_flash_attn(fa_version: int) -> dict[str, object]:
         fa_version=fa_version,
     )
     torch.cuda.synchronize()
-    return {"shape": list(out.shape), "dtype": str(out.dtype), "finite": bool(torch.isfinite(out).all())}
+    return {
+        "shape": list(out.shape),
+        "dtype": str(out.dtype),
+        "finite": bool(torch.isfinite(out).all()),
+    }
 
 
 def _check_stepaudio_plugin(model_path: str) -> dict[str, object]:
     from vllm.config import ModelConfig
     from vllm.model_executor.models import ModelRegistry
     from vllm.multimodal import MULTIMODAL_REGISTRY
-    from vllm.plugins import load_general_plugins
     from vllm.tokenizers import get_tokenizer
     from vllm.transformers_utils.config import get_config
+
+    from vllm.plugins import load_general_plugins
 
     load_general_plugins()
 
     cfg = get_config(model_path, trust_remote_code=False)
-    tok = get_tokenizer(model_path, tokenizer_mode="step_audio_2", trust_remote_code=False)
+    tok = get_tokenizer(
+        model_path, tokenizer_mode="step_audio_2", trust_remote_code=False
+    )
     model_config = ModelConfig(
         model=model_path,
         tokenizer_mode="step_audio_2",

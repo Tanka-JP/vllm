@@ -29,9 +29,9 @@ def register() -> None:
     )
 
     vllm_config._CONFIG_REGISTRY[StepAudio2Config.model_type] = StepAudio2Config
-    vllm_config._CONFIG_REGISTRY[
-        StepAudio2EncoderConfig.model_type
-    ] = StepAudio2EncoderConfig
+    vllm_config._CONFIG_REGISTRY[StepAudio2EncoderConfig.model_type] = (
+        StepAudio2EncoderConfig
+    )
     vllm_config._CONFIG_REGISTRY[StepAudio2TextConfig.model_type] = StepAudio2TextConfig
 
     TokenizerRegistry.register(

@@ -47,7 +47,9 @@ def _completion_row(output: Any) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("audio", nargs="+", type=Path)
-    parser.add_argument("--model-path", default="/data/liujun/stepaudio-merged/v25_C0_ep3")
+    parser.add_argument(
+        "--model-path", default="/data/liujun/stepaudio-merged/v25_C0_ep3"
+    )
     parser.add_argument("--served-model-name", default="stepaudio-v25-c0-ep3")
     parser.add_argument("--native-src", default="/data/cbhua/step-audio-finetune/src")
     parser.add_argument("--max-tokens", type=int, default=32)
@@ -59,6 +61,7 @@ def main() -> int:
 
     sys.path.insert(0, args.native_src)
     from step_audio_finetune.prompt import v5_v2three_thinking_instruction
+
     from vllm import LLM, SamplingParams
 
     system_prompt = v5_v2three_thinking_instruction({})

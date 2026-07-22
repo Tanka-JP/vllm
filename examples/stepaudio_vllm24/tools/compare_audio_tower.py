@@ -52,7 +52,9 @@ def _decode_audio(raw: bytes, target_sr: int) -> np.ndarray:
     return np.ascontiguousarray(data.astype(np.float32))
 
 
-def _load_audio_state(shard_path: Path) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+def _load_audio_state(
+    shard_path: Path,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     state = safetensors.torch.load_file(str(shard_path), device="cpu")
     encoder = {
         key.removeprefix("encoder."): value
@@ -94,7 +96,9 @@ def _stats(a: torch.Tensor, b: torch.Tensor) -> dict[str, Any]:
         "exact": bool(torch.equal(a.detach().cpu(), b.detach().cpu())),
         "max_abs": float(diff.abs().max().item()) if diff.numel() else 0.0,
         "mean_abs": float(diff.abs().mean().item()) if diff.numel() else 0.0,
-        "rms": float(math.sqrt(torch.mean(diff * diff).item())) if diff.numel() else 0.0,
+        "rms": float(math.sqrt(torch.mean(diff * diff).item()))
+        if diff.numel()
+        else 0.0,
         "max_rel": float(rel.max().item()) if rel.numel() else 0.0,
     }
 
@@ -102,10 +106,22 @@ def _stats(a: torch.Tensor, b: torch.Tensor) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("audio", nargs="+", type=Path)
-    parser.add_argument("--checkpoint-dir", type=Path, default=Path("/data/cbhua/step-audio-finetune/checkpoints"))
-    parser.add_argument("--shard", type=Path, default=Path("/data/liujun/stepaudio-merged/v25_C0_ep3/model-00001-of-00007.safetensors"))
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=Path("/data/cbhua/step-audio-finetune/checkpoints"),
+    )
+    parser.add_argument(
+        "--shard",
+        type=Path,
+        default=Path(
+            "/data/liujun/stepaudio-merged/v25_C0_ep3/model-00001-of-00007.safetensors"
+        ),
+    )
     parser.add_argument("--target-sr", type=int, default=16000)
-    parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--device", default="cuda:0" if torch.cuda.is_available() else "cpu"
+    )
     parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     args = parser.parse_args()
 
@@ -113,14 +129,27 @@ def main() -> int:
     dtype = _parse_dtype(args.dtype)
 
     native = _load_native_modeling(args.checkpoint_dir)
-    from vllm.plugins.stepaudio_vllm24 import mm_step_audio as vllm_audio
     from step_audio_finetune import _modeling_helpers
 
+    from vllm.plugins.stepaudio_vllm24 import mm_step_audio as vllm_audio
+
     encoder_sd, adapter_sd = _load_audio_state(args.shard)
-    native_encoder = native.AudioEncoder(128, 1500, 1280, 20, 32).to(device=device, dtype=dtype).eval()
-    native_adapter = native.Adaptor(1280, 5120, 3, 2).to(device=device, dtype=dtype).eval()
-    vllm_encoder = vllm_audio.AudioEncoder(128, 1500, 1280, 20, 32).to(device=device, dtype=dtype).eval()
-    vllm_adapter = vllm_audio.Adaptor(1280, 5120, 3, 2).to(device=device, dtype=dtype).eval()
+    native_encoder = (
+        native.AudioEncoder(128, 1500, 1280, 20, 32)
+        .to(device=device, dtype=dtype)
+        .eval()
+    )
+    native_adapter = (
+        native.Adaptor(1280, 5120, 3, 2).to(device=device, dtype=dtype).eval()
+    )
+    vllm_encoder = (
+        vllm_audio.AudioEncoder(128, 1500, 1280, 20, 32)
+        .to(device=device, dtype=dtype)
+        .eval()
+    )
+    vllm_adapter = (
+        vllm_audio.Adaptor(1280, 5120, 3, 2).to(device=device, dtype=dtype).eval()
+    )
     native_encoder.load_state_dict(encoder_sd, strict=True)
     native_adapter.load_state_dict(adapter_sd, strict=True)
     vllm_encoder.load_state_dict(encoder_sd, strict=True)
@@ -134,7 +163,9 @@ def main() -> int:
         lens = torch.tensor([native_mel.shape[-1]], device=device, dtype=torch.long)
 
         with torch.inference_mode():
-            native_enc, native_len = native_encoder(native_mel.unsqueeze(0).to(dtype), lens)
+            native_enc, native_len = native_encoder(
+                native_mel.unsqueeze(0).to(dtype), lens
+            )
             vllm_enc, vllm_len = vllm_encoder(vllm_mel.unsqueeze(0).to(dtype), lens)
             native_adapt = native_adapter(native_enc)
             vllm_adapt = vllm_adapter(vllm_enc)

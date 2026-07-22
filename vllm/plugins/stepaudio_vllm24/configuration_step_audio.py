@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional, Union
-
 from transformers import Qwen2Config
 from transformers.configuration_utils import PretrainedConfig
 
@@ -112,11 +110,11 @@ class StepAudio2Config(PretrainedConfig):
 
     def __init__(
         self,
-        audio_encoder_config: Optional[Union[dict, StepAudio2EncoderConfig]] = None,
-        text_config: Optional[Union[dict, StepAudio2TextConfig, Qwen2Config]] = None,
+        audio_encoder_config: dict | StepAudio2EncoderConfig | None = None,
+        text_config: dict | StepAudio2TextConfig | Qwen2Config | None = None,
         use_sliding_window: bool = False,
-        sliding_window: Optional[int] = 2048,
-        max_window_layers: Optional[int] = None,
+        sliding_window: int | None = 2048,
+        max_window_layers: int | None = None,
         **kwargs,
     ) -> None:
         kwargs.setdefault("use_sliding_window", use_sliding_window)
@@ -137,8 +135,6 @@ class StepAudio2Config(PretrainedConfig):
         if audio_encoder_config is None:
             self.audio_encoder_config = StepAudio2EncoderConfig()
         elif isinstance(audio_encoder_config, dict):
-            self.audio_encoder_config = StepAudio2EncoderConfig(
-                **audio_encoder_config
-            )
+            self.audio_encoder_config = StepAudio2EncoderConfig(**audio_encoder_config)
         else:
             self.audio_encoder_config = audio_encoder_config

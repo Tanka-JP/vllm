@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from functools import cached_property
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 from transformers import Qwen2TokenizerFast
@@ -44,7 +44,10 @@ class StepAudio2Tokenizer(Qwen2TokenizerFast):
         return self.vocab.get(self._audio_pad_token)
 
     def is_step_audio_token(self, token_id: int) -> bool:
-        return self.first_audio_token_id is not None and token_id >= self.first_audio_token_id
+        return (
+            self.first_audio_token_id is not None
+            and token_id >= self.first_audio_token_id
+        )
 
     @staticmethod
     def _content_to_text(content: Any) -> str:
@@ -71,7 +74,7 @@ class StepAudio2Tokenizer(Qwen2TokenizerFast):
     def _render_step_audio_chat(
         self,
         conversation: list[dict[str, Any]],
-        tools: Optional[list[dict[str, Any]]] = None,
+        tools: list[dict[str, Any]] | None = None,
         add_generation_prompt: bool = False,
         continue_final_message: bool = False,
     ) -> str:
@@ -86,7 +89,9 @@ class StepAudio2Tokenizer(Qwen2TokenizerFast):
         if tools:
             result.append("<|BOT|>system\n")
             if messages and messages[0].get("role") == "system":
-                result.append(self._content_to_text(messages[0].get("content")) + "<|EOT|>")
+                result.append(
+                    self._content_to_text(messages[0].get("content")) + "<|EOT|>"
+                )
             result.append("<|BOT|>tool_json_schemas\n")
             result.append(json.dumps(tools, ensure_ascii=False) + "<|EOT|>")
         elif messages and messages[0].get("role") == "system":
@@ -142,20 +147,20 @@ class StepAudio2Tokenizer(Qwen2TokenizerFast):
 
     def apply_chat_template(
         self,
-        conversation: Union[list[dict[str, Any]], list[list[dict[str, Any]]]],
-        tools: Optional[list[dict[str, Any]]] = None,
-        documents: Optional[list[dict[str, str]]] = None,
-        chat_template: Optional[str] = None,
+        conversation: list[dict[str, Any]] | list[list[dict[str, Any]]],
+        tools: list[dict[str, Any]] | None = None,
+        documents: list[dict[str, str]] | None = None,
+        chat_template: str | None = None,
         add_generation_prompt: bool = False,
         continue_final_message: bool = False,
         tokenize: bool = True,
         padding: bool = False,
         truncation: bool = False,
-        max_length: Optional[int] = None,
-        return_tensors: Optional[str] = None,
+        max_length: int | None = None,
+        return_tensors: str | None = None,
         return_dict: bool = False,
         return_assistant_tokens_mask: bool = False,
-        tokenizer_kwargs: Optional[dict[str, Any]] = None,
+        tokenizer_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> Any:
         del documents, chat_template, return_assistant_tokens_mask, kwargs

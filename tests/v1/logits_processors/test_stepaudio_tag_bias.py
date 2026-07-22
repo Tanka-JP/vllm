@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from vllm.v1.sample.logits_processor import BatchUpdate, MoveDirectionality
 
 from vllm import SamplingParams
 from vllm.plugins.stepaudio_vllm24.logits_processor import (
@@ -22,7 +23,6 @@ from vllm.plugins.stepaudio_vllm24.logits_processor import (
     build_stepaudio_tag_token_spec,
     parse_stepaudio_tag_bias_params,
 )
-from vllm.v1.sample.logits_processor import BatchUpdate, MoveDirectionality
 
 
 class FakeStepAudioTokenizer:

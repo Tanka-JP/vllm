@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 from urllib import request
 
@@ -96,7 +95,9 @@ def _vllm_next_token(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", default="/data/liujun/stepaudio-merged/v25_C0_ep3")
+    parser.add_argument(
+        "--model-path", default="/data/liujun/stepaudio-merged/v25_C0_ep3"
+    )
     parser.add_argument("--server-url", default="http://127.0.0.1:8010/v1")
     parser.add_argument("--served-model-name", default="stepaudio-v25-c0-ep3")
     parser.add_argument("--device", default="cuda:0")

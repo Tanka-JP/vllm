@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any, Optional, TypedDict, Union
+from typing import Any, TypedDict
 
 import librosa
 import numpy as np
@@ -13,6 +13,20 @@ from transformers import BatchFeature, PretrainedConfig, TensorType
 from vllm.config import VllmConfig
 from vllm.inputs import MultiModalDataDict
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.interfaces import (
+    MultiModalEmbeddings,
+    SupportsLoRA,
+    SupportsMultiModal,
+    SupportsPP,
+)
+from vllm.model_executor.models.module_mapping import MultiModelKeys
+from vllm.model_executor.models.utils import (
+    AutoWeightsLoader,
+    WeightsMapper,
+    flatten_bn,
+    init_vllm_registered_model,
+    maybe_prefix,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
 from vllm.multimodal.parse import (
@@ -31,28 +45,13 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import TokenizerLike
 
-from vllm.model_executor.models.interfaces import (
-    MultiModalEmbeddings,
-    SupportsLoRA,
-    SupportsMultiModal,
-    SupportsPP,
-)
-from vllm.model_executor.models.module_mapping import MultiModelKeys
-from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
-    flatten_bn,
-    init_vllm_registered_model,
-    maybe_prefix,
-)
-
 AUDIO_PATCH_TOKEN_ID = 151690
 
 
 class Step1fAudioInputs(TypedDict):
     audio_waveforms: list[torch.Tensor]
     audio_lens: list[int]
-    audio_mels: Optional[torch.Tensor]
+    audio_mels: torch.Tensor | None
 
 
 def _as_int_list(x: object) -> list[int]:
@@ -230,7 +229,11 @@ class Step1fProcessor:
             *([self.audio_token_id] * num_audio_tokens),
             self.tokenizer.convert_tokens_to_ids("<audio_end>"),
         ]
-        embed_mask = [False, *([True] * num_audio_tokens), num_audio_embeddings > num_audio_tokens]
+        embed_mask = [
+            False,
+            *([True] * num_audio_tokens),
+            num_audio_embeddings > num_audio_tokens,
+        ]
         return text, token_ids, embed_mask
 
     @staticmethod
@@ -248,9 +251,9 @@ class Step1fProcessor:
 
     def __call__(
         self,
-        text: Optional[Union[str, list[str]]] = None,
-        audios: Union[np.ndarray, list[np.ndarray], None] = None,
-        return_tensors: Optional[Union[str, TensorType]] = None,
+        text: str | list[str] | None = None,
+        audios: np.ndarray | list[np.ndarray] | None = None,
+        return_tensors: str | TensorType | None = None,
         **kwargs: Any,
     ) -> BatchFeature:
         if audios is None:
@@ -306,7 +309,7 @@ class Step1fAudioProcessingInfo(BaseProcessingInfo):
     def get_data_parser(self):
         return MultiModalDataParser(target_sr=16000)
 
-    def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"audio": None}
 
     def get_mm_max_tokens_per_item(
@@ -453,7 +456,7 @@ class Conv1d(nn.Conv1d):
         self,
         input: torch.Tensor,
         weight: torch.Tensor,
-        bias: Optional[torch.Tensor],
+        bias: torch.Tensor | None,
     ) -> torch.Tensor:
         return super()._conv_forward(
             input,
@@ -474,7 +477,7 @@ class MultiHeadAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
+        mask: torch.Tensor | None = None,
     ):
         q = self.query(x)
         k = self.key(x)
@@ -487,7 +490,7 @@ class MultiHeadAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
+        mask: torch.Tensor | None = None,
     ):
         _, _, dim = q.shape
         scale = (dim // self.n_head) ** -0.25
@@ -508,17 +511,21 @@ class ResidualAttentionBlock(nn.Module):
         self.attn = MultiHeadAttention(n_state, n_head)
         self.attn_ln = LayerNorm(n_state)
         n_mlp = n_state * 4
-        self.mlp = nn.Sequential(Linear(n_state, n_mlp), nn.GELU(), Linear(n_mlp, n_state))
+        self.mlp = nn.Sequential(
+            Linear(n_state, n_mlp), nn.GELU(), Linear(n_mlp, n_state)
+        )
         self.mlp_ln = LayerNorm(n_state)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None):
         x = x + self.attn(self.attn_ln(x.contiguous()), mask=mask)[0]
         x = x + self.mlp(self.mlp_ln(x.contiguous()))
         return x
 
 
 class AudioEncoder(nn.Module):
-    def __init__(self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int):
+    def __init__(
+        self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int
+    ):
         super().__init__()
         self.conv1 = Conv1d(n_mels, n_state, kernel_size=3, padding=1)
         self.conv2 = Conv1d(n_state, n_state, kernel_size=3, stride=2, padding=1)
@@ -530,14 +537,20 @@ class AudioEncoder(nn.Module):
         self.avg_pooler = nn.AvgPool1d(2, stride=2)
         self.after_norm = LayerNorm(n_state)
 
-    def forward(self, x: torch.Tensor, x_len: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, x_len: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         t = x.size(-1)
         x = F.gelu(self.conv1(x))
         x = F.gelu(self.conv2(x))
         x = x.permute(0, 2, 1)
         mask = make_non_pad_mask(x_len, t).unsqueeze(1)
         mask = mask_to_bias(mask[:, :, (t + 1) % 2 :: 2], x.dtype)
-        x = (x + self.positional_embedding.weight[: x.shape[1], :]).to(x.dtype).contiguous()
+        x = (
+            (x + self.positional_embedding.weight[: x.shape[1], :])
+            .to(x.dtype)
+            .contiguous()
+        )
         for block in self.blocks:
             x = block(x, mask.unsqueeze(1))
         x = x.permute(0, 2, 1)
@@ -598,7 +611,7 @@ class StepAudio2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsL
     )
 
     @classmethod
-    def get_placeholder_str(cls, modality: str, i: int) -> Optional[str]:
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("audio"):
             return "<audio_patch>"
         raise ValueError("Only audio modality is supported")
@@ -654,7 +667,7 @@ class StepAudio2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsL
 
     def _parse_and_validate_audio_input(
         self, **kwargs: object
-    ) -> Optional[Step1fAudioInputs]:
+    ) -> Step1fAudioInputs | None:
         audio_waveforms = kwargs.pop("audio_waveforms", None)
         audio_waveform_lens = kwargs.pop("audio_waveform_lens", None)
         audio_mels = kwargs.pop("audio_mels", None)
@@ -703,7 +716,9 @@ class StepAudio2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsL
                 _stepaudio_log_mel_spectrogram(wav, n_mels=128).to(self.dtype)
                 for wav in audio_input["audio_waveforms"]
             ]
-            audio_lens = torch.tensor([mel.shape[-1] for mel in mel_list], device=self.device)
+            audio_lens = torch.tensor(
+                [mel.shape[-1] for mel in mel_list], device=self.device
+            )
             max_len = max(mel.shape[-1] for mel in mel_list)
             audio_mels = torch.stack(
                 [F.pad(mel, (0, max_len - mel.shape[-1])) for mel in mel_list],
@@ -769,7 +784,9 @@ class StepAudio2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsL
                 (".gate_up_proj", ".gate_proj", 0),
                 (".gate_up_proj", ".up_proj", 1),
             ]
-            for name, loaded_weight in ((self.maybe_remap_params(n), w) for n, w in weights):
+            for name, loaded_weight in (
+                (self.maybe_remap_params(n), w) for n, w in weights
+            ):
                 for param_name, weight_name, shard_id in stacked_params_mapping:
                     if weight_name not in name:
                         continue
@@ -780,7 +797,9 @@ class StepAudio2ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsL
                     break
                 else:
                     param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
             return loaded_params
