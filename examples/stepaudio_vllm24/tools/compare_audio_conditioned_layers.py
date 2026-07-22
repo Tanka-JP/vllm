@@ -733,13 +733,21 @@ def _native_hidden_dump(
     device: str,
     trace_sublayers: bool,
     trace_weights: bool,
+    prompt_template: str,
+    tag_bias: float,
 ) -> dict[str, Any]:
     _add_native_src(native_src)
     from step_audio_finetune import _modeling_helpers  # noqa: PLC0415
     from step_audio_finetune.prompt import (  # noqa: PLC0415
         build_tagged_text_prompt,
+        v5_v2five_thinking_instruction,
         v5_v2three_thinking_instruction,
     )
+
+    instruction_template = {
+        "v2three": v5_v2three_thinking_instruction,
+        "v2five": v5_v2five_thinking_instruction,
+    }[prompt_template]
 
     audio_path = Path(row["audio"])
     native_ids = [int(x) for x in row["native"]["token_ids"]]
@@ -770,8 +778,8 @@ def _native_hidden_dump(
     prompt_text = build_tagged_text_prompt(
         {},
         n_audio_patches=n_patches,
-        instruction_template=v5_v2three_thinking_instruction,
-        transcript=None,
+        instruction_template=instruction_template,
+        transcript=row.get("transcript"),
         add_thinking_prefix=True,
     )
     prompt_ids = tokenizer(
@@ -804,14 +812,30 @@ def _native_hidden_dump(
         [h[0, -1].detach().cpu().float() for h in out.hidden_states]
     )
     logits_last = out.logits[0, -1].detach().cpu().float()
+    adjusted_logits = logits_last.clone()
+    if tag_bias != 0.0:
+        open_ids = []
+        less_than = tokenizer("<", add_special_tokens=False)["input_ids"]
+        adjacent = tokenizer("><", add_special_tokens=False)["input_ids"]
+        if less_than:
+            open_ids.append(int(less_than[-1]))
+        if len(adjacent) == 1:
+            open_ids.append(int(adjacent[0]))
+        for token_id in dict.fromkeys(open_ids):
+            adjusted_logits[token_id] += tag_bias
     candidate_ids = [int(native_ids[common]), int(vllm_ids[common])]
     candidate_logits = {
         str(token_id): float(logits_last[token_id].item())
         for token_id in candidate_ids
     }
-    top = torch.topk(logits_last, k=8)
+    adjusted_candidate_logits = {
+        str(token_id): float(adjusted_logits[token_id].item())
+        for token_id in candidate_ids
+    }
+    top = torch.topk(adjusted_logits, k=8)
     report = {
         "audio": str(audio_path),
+        "transcript": row.get("transcript") or "",
         "prompt_token_count": int(prompt_ids.shape[-1]),
         "full_token_count": len(full_ids),
         "common_prefix_len": common,
@@ -826,6 +850,9 @@ def _native_hidden_dump(
             "token": tokenizer.decode([int(vllm_ids[common])], skip_special_tokens=False),
         },
         "native_candidate_logits": candidate_logits,
+        "native_adjusted_candidate_logits": adjusted_candidate_logits,
+        "tag_bias": tag_bias,
+        "prompt_template": prompt_template,
         "native_top8": [
             {
                 "token_id": int(token_id),
@@ -861,8 +888,13 @@ def _vllm_hidden_dump(
     hf_style_layer0_attention: bool,
     hf_style_layer0_sdpa: bool,
     hf_style_layer0_sdpa_backend: str,
+    prompt_template: str,
+    tag_bias: float,
 ) -> dict[str, Any]:
     from vllm import LLM, SamplingParams  # noqa: PLC0415
+    from vllm.plugins.stepaudio_vllm24.logits_processor import (  # noqa: PLC0415
+        StepAudioTagBiasLogitsProcessor,
+    )
 
     if hf_style_rmsnorm:
         _patch_vllm_rmsnorm_hf_style()
@@ -882,6 +914,13 @@ def _vllm_hidden_dump(
         enforce_eager=True,
         enable_prefix_caching=False,
         disable_log_stats=True,
+        attention_config={"backend": "TRITON_ATTN"},
+        ir_op_priority={
+            "rms_norm": ["native"],
+            "fused_add_rms_norm": ["native"],
+        },
+        compilation_config={"custom_ops": ["none"]},
+        logits_processors=[StepAudioTagBiasLogitsProcessor],
     )
 
     _install_vllm_layer_hooks(
@@ -916,9 +955,16 @@ def _vllm_hidden_dump(
 
     # Use the exact instruction string from the native package when available.
     try:
-        from step_audio_finetune.prompt import v5_v2three_thinking_instruction  # type: ignore
+        from step_audio_finetune.prompt import (  # type: ignore
+            v5_v2five_thinking_instruction,
+            v5_v2three_thinking_instruction,
+        )
 
-        messages[0]["content"] = v5_v2three_thinking_instruction({})
+        instruction_template = {
+            "v2three": v5_v2three_thinking_instruction,
+            "v2five": v5_v2five_thinking_instruction,
+        }[prompt_template]
+        messages[0]["content"] = instruction_template({})
     except Exception:
         pass
 
@@ -926,12 +972,21 @@ def _vllm_hidden_dump(
         [
             {
                 "role": "user",
-                "content": [
-                    {
+                "content": (
+                    ([{
+                        "type": "text",
+                        "text": (
+                            "TRANSCRIPT: "
+                            f"{native_report['transcript'].strip()}"
+                        ),
+                    }]
+                     if native_report.get("transcript", "").strip()
+                     else [])
+                    + [{
                         "type": "audio_url",
                         "audio_url": {"url": f"data:audio/wav;base64,{audio_b64}"},
-                    }
-                ],
+                    }]
+                ),
             },
             {
                 "role": "assistant",
@@ -949,6 +1004,14 @@ def _vllm_hidden_dump(
         stop_token_ids=[151665],
         ignore_eos=True,
         skip_special_tokens=False,
+        logprobs=20,
+        # The generated prefix is supplied as assistant prompt text in this
+        # one-token probe, so </think> is not present in output_ids. Apply the
+        # production bias unconditionally at the probed post-think decision.
+        extra_args={
+            "stepaudio_tag_bias": tag_bias,
+            "stepaudio_tag_bias_gate": "always",
+        },
     )
     out = llm.chat(
         messages,
@@ -963,14 +1026,27 @@ def _vllm_hidden_dump(
     layer_trace = TRACE.get(pass_idx, {})
     final = TRACE_FINAL.get(pass_idx)
     positions = TRACE_POSITIONS.get(pass_idx)
+    first_logprobs = {}
+    if completion.logprobs:
+        first_logprobs = {
+            str(token_id): {
+                "logprob": float(item.logprob),
+                "rank": item.rank,
+                "decoded_token": item.decoded_token,
+            }
+            for token_id, item in completion.logprobs[0].items()
+        }
     return {
         "prompt_token_count": len(out.prompt_token_ids or []),
         "generated_token_ids": [int(x) for x in completion.token_ids],
         "generated_text": completion.text,
+        "first_token_logprobs": first_logprobs,
         "pass_idx": pass_idx,
         "hf_style_layer0_sdpa_backend": hf_style_layer0_sdpa_backend
         if hf_style_layer0_sdpa
         else None,
+        "tag_bias": tag_bias,
+        "prompt_template": prompt_template,
         "positions_count": int(positions.numel()) if positions is not None else None,
         "layer_hidden_last": {
             int(layer): tensor for layer, tensor in layer_trace.items()
@@ -1004,6 +1080,12 @@ def main() -> int:
     parser.add_argument("--hf-style-layer0-attention", action="store_true")
     parser.add_argument("--hf-style-layer0-sdpa", action="store_true")
     parser.add_argument(
+        "--prompt-template",
+        choices=("v2three", "v2five"),
+        default="v2three",
+    )
+    parser.add_argument("--tag-bias", type=float, default=0.0)
+    parser.add_argument(
         "--hf-style-layer0-sdpa-backend",
         choices=["auto", "math", "flash", "mem_efficient", "cudnn"],
         default="auto",
@@ -1022,6 +1104,8 @@ def main() -> int:
             device=args.device,
             trace_sublayers=args.trace_layer0_sublayers,
             trace_weights=args.trace_layer0_weights,
+            prompt_template=args.prompt_template,
+            tag_bias=args.tag_bias,
         )
     if args.native_pt_out is not None:
         args.native_pt_out.parent.mkdir(parents=True, exist_ok=True)
@@ -1058,6 +1142,8 @@ def main() -> int:
         hf_style_layer0_attention=args.hf_style_layer0_attention,
         hf_style_layer0_sdpa=args.hf_style_layer0_sdpa,
         hf_style_layer0_sdpa_backend=args.hf_style_layer0_sdpa_backend,
+        prompt_template=args.prompt_template,
+        tag_bias=args.tag_bias,
     )
 
     native_hidden = native.pop("hidden_last")
