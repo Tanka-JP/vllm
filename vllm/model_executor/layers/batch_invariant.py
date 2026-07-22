@@ -882,11 +882,10 @@ def rms_norm_batch_invariant(
 
 
 def linear_batch_invariant(input, weight, bias=None):
-    output = matmul_batch_invariant(input, weight.t())
-
-    if bias is not None:
-        output = output + bias
-    return output
+    output_shape = input.shape[:-1] + (weight.shape[0],)
+    input_2d = input.reshape(-1, input.shape[-1])
+    output = matmul_persistent(input_2d, weight.t(), bias=bias)
+    return output.reshape(output_shape)
 
 
 _batch_invariant_MODE = False

@@ -11,7 +11,11 @@ import pytest
 import torch
 from utils import skip_unsupported
 
-from vllm.model_executor.layers.batch_invariant import matmul_batch_invariant
+from vllm.model_executor.layers.batch_invariant import (
+    linear_batch_invariant,
+    matmul_batch_invariant,
+    matmul_persistent,
+)
 from vllm.platforms import current_platform
 
 DEVICE_TYPE = current_platform.device_type
@@ -78,6 +82,42 @@ def test_matmul_correctness(a_shape, b_shape, dtype):
         atol=atol,
         msg=f"matmul mismatch for a ndim={a.ndim}, b ndim={b.ndim},",
     )
+
+
+@skip_unsupported
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_linear_fuses_bias_before_output_cast(dtype):
+    device = torch.device(DEVICE_TYPE)
+
+    torch.manual_seed(42)
+    input = torch.randn((2, 3, 64), dtype=dtype, device=device)
+    weight = torch.randn((32, 64), dtype=dtype, device=device)
+    bias = torch.randn((32,), dtype=dtype, device=device)
+
+    expected = matmul_persistent(
+        input.reshape(-1, input.shape[-1]), weight.t(), bias=bias
+    ).reshape(2, 3, 32)
+    actual = linear_batch_invariant(input, weight, bias)
+
+    assert torch.equal(actual, expected)
+
+
+@skip_unsupported
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_linear_with_bias_is_batch_invariant(dtype):
+    device = torch.device(DEVICE_TYPE)
+
+    torch.manual_seed(42)
+    input_single = torch.rand((1, 64, 32), dtype=dtype, device=device)
+    weight = torch.rand((128, 32), dtype=dtype, device=device)
+    bias = torch.rand((128,), dtype=dtype, device=device)
+    single_output = linear_batch_invariant(input_single, weight, bias)
+
+    input_batch = torch.rand((8, 64, 32), dtype=dtype, device=device)
+    input_batch[3] = input_single[0]
+    batch_output = linear_batch_invariant(input_batch, weight, bias)
+
+    assert torch.equal(single_output[0], batch_output[3])
 
 
 @skip_unsupported
