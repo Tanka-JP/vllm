@@ -276,8 +276,21 @@ class Step1fProcessor:
                 if isinstance(audio, tuple) and len(audio) == 2:
                     audio = audio[0]
                 audio = np.asarray(audio, dtype=np.float32)
+                if audio.ndim != 1:
+                    raise ValueError(
+                        "StepAudio expects a one-dimensional mono audio waveform, "
+                        f"but received shape {audio.shape}."
+                    )
+                max_samples = int(self.sampling_rate * self.max_chunk_size)
+                num_samples = audio.shape[0]
+                if num_samples > max_samples:
+                    raise ValueError(
+                        "StepAudio audio exceeds the safe processor limit: "
+                        f"{num_samples / self.sampling_rate:.3f}s > "
+                        f"{self.max_chunk_size}s"
+                    )
                 audio_waveforms_lst.append(torch.from_numpy(audio))
-                audio_waveform_lens.append(len(audio))
+                audio_waveform_lens.append(num_samples)
                 audio_feat_len = self.get_audio_feature_len(audio)
                 audio_lens.append(audio_feat_len)
                 audio_repl_str, _, _ = self._get_audio_repl(audio_feat_len)
@@ -304,7 +317,7 @@ class Step1fAudioProcessingInfo(BaseProcessingInfo):
         return Step1fProcessor(self.get_hf_config(), self.get_tokenizer())
 
     def get_data_parser(self):
-        return MultiModalDataParser(target_sr=16000)
+        return MultiModalDataParser(target_sr=16000, target_channels=1)
 
     def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
         return {"audio": None}
@@ -537,6 +550,11 @@ class AudioEncoder(nn.Module):
         x = x.permute(0, 2, 1)
         mask = make_non_pad_mask(x_len, t).unsqueeze(1)
         mask = mask_to_bias(mask[:, :, (t + 1) % 2 :: 2], x.dtype)
+        if x.shape[1] > self.positional_embedding.num_embeddings:
+            raise ValueError(
+                "StepAudio mel sequence exceeds audio positional embeddings: "
+                f"{x.shape[1]} > {self.positional_embedding.num_embeddings}"
+            )
         x = (x + self.positional_embedding.weight[: x.shape[1], :]).to(x.dtype).contiguous()
         for block in self.blocks:
             x = block(x, mask.unsqueeze(1))
