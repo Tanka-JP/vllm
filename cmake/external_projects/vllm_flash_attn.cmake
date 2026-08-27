@@ -38,8 +38,13 @@ if(VLLM_FLASH_ATTN_SRC_DIR)
 else()
   FetchContent_Declare(
           vllm-flash-attn
-          GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
-          GIT_TAG 803020a8fa15407871341d41eba4919ade2ee1ee
+          # Fork of vllm-project/flash-attention @ 803020a8fa1540 with one fix:
+          # FA3 read the SM count out of torch's cudaDeviceProp, which is not
+          # ABI-stable across CUDA major versions and returned 1 here, starving
+          # the decode scheduler. Drop back to the upstream pin once it lands
+          # there.
+          GIT_REPOSITORY https://github.com/Tanka-JP/flash-attention.git
+          GIT_TAG 0db9056bd44837e2ec4133c46c1f8d3aaf582455
           GIT_PROGRESS TRUE
           # Don't share the vllm-flash-attn build between build types
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
